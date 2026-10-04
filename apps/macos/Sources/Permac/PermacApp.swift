@@ -10,16 +10,25 @@ struct PermacApp: App {
     var body: some Scene {
         Window("Permac", id: "main") {
             ContentView(model: model)
-                .frame(minWidth: 760, minHeight: 520)
+                .frame(minWidth: 860, minHeight: 640)
         }
-        MenuBarExtra("Permac", systemImage: "sparkles") {
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1080, height: 760)
+        MenuBarExtra {
+            menu
+        } label: {
+            PermacLogoView(size: 18)
+        }
+    }
+
+    @ViewBuilder
+    private var menu: some View {
             Button("Open") { PermacDelegate.presentMainWindow() }
             Divider()
             Text(model.listening ? "Listening" : "Idle")
             Button("Stop") { model.stop(.run) }
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
-        }
     }
 }
 
@@ -28,27 +37,61 @@ final class PermacDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         DispatchQueue.main.async {
             Self.presentMainWindow()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                if let window = NSApp.windows.first(where: { $0.canBecomeKey }) {
+                    Self.place(window)
+                }
+            }
         }
     }
 
     static func presentMainWindow() {
+        NSApp.appearance = NSAppearance(named: .aqua)
+        if let image = PermacLogo.image {
+            NSApp.applicationIconImage = image
+        }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         let visible = NSApp.windows.filter { $0.canBecomeKey && $0.isVisible }
         if let window = visible.first {
+            place(window)
             window.makeKeyAndOrderFront(nil)
             return
         }
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            contentRect: NSRect(x: 0, y: 0, width: 1080, height: 760),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "Permac"
         window.contentView = NSHostingView(rootView: ContentView(model: AppModel.shared))
-        window.center()
+        place(window)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    private static func place(_ window: NSWindow) {
+        style(window)
+        let pointer = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) }) ?? NSScreen.main else {
+            window.center()
+            return
+        }
+        let visible = screen.visibleFrame
+        var frame = window.frame
+        frame.size = NSSize(width: min(1080, visible.width - 48), height: min(760, visible.height - 48))
+        frame.origin.x = visible.midX - frame.width / 2
+        frame.origin.y = visible.midY - frame.height / 2
+        window.setFrame(frame, display: true)
+    }
+
+    private static func style(_ window: NSWindow) {
+        window.appearance = NSAppearance(named: .aqua)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.isOpaque = true
+        window.backgroundColor = Muse.canvasNS
+        window.isMovableByWindowBackground = true
     }
 }
 
@@ -73,14 +116,61 @@ final class AppModel {
     var schemaError = false
     var projection = Projection()
     private var seenApprovals: Set<String> = []
+    private var link: CoordinatorLink?
+    private var connected = false
 
     var selected: TaskRow? { tasks.first { $0.id == selectedID } }
+
+    var reviewCount: Int {
+        tasks.filter { $0.state == "waiting_approval" || $0.state == "waiting_input" }.count
+    }
+
+    var presence: String {
+        if schemaError { return "Unsupported event schema" }
+        if let task = tasks.first(where: { $0.state == "waiting_approval" }) {
+            return "Ready to review · \(clipped(task.instruction))"
+        }
+        if let task = tasks.first(where: { $0.state == "waiting_input" }) {
+            return "Needs your input · \(clipped(task.instruction))"
+        }
+        if let task = tasks.first(where: { $0.state == "running" }) {
+            return clipped(task.instruction)
+        }
+        if tasks.contains(where: { $0.state == "queued" }) { return "Picking up your next task…" }
+        return "Here when you need me"
+    }
+
+    func note(_ text: String) {
+        status = text
+    }
+
+    func connect() {
+        guard link == nil else { return }
+        let link = CoordinatorLink()
+        link.onStatus = { [weak self] message in
+            self?.connected = message.hasPrefix("Connected")
+            self?.status = message
+        }
+        link.onEvent = { [weak self] data in
+            self?.ingest(data)
+        }
+        link.onTask = { [weak self] id, instruction, state, error in
+            self?.upsert(id: id, instruction: instruction, state: state, text: error ?? "")
+        }
+        self.link = link
+        link.start()
+    }
 
     func submit(instruction: String, consequential: Bool) {
         let trimmed = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         if consequential && !transcriptReviewed {
             status = "Review the transcript before a consequential action."
+            return
+        }
+        if connected, let link {
+            status = "Sending to the coordinator."
+            link.submit(instruction: trimmed, source: consequential ? "voice" : "text")
             return
         }
         let row = TaskRow(id: UUID().uuidString, instruction: trimmed, state: "queued", text: "")
@@ -98,8 +188,23 @@ final class AppModel {
         }
         projection = next
         tasks = next.tasks.map { id, task in
-            TaskRow(id: id, instruction: tasks.first { $0.id == id }?.instruction ?? "Task", state: task.state, text: task.text)
+            let previous = tasks.first { $0.id == id }
+            let instruction = task.instruction.isEmpty ? (previous?.instruction ?? "Task") : task.instruction
+            let text = task.text.isEmpty ? (previous?.text ?? "") : task.text
+            return TaskRow(id: id, instruction: instruction, state: task.state, text: text)
         }
+    }
+
+    private func upsert(id: String, instruction: String, state: String, text: String) {
+        if let index = tasks.firstIndex(where: { $0.id == id }) {
+            tasks[index].instruction = instruction
+            tasks[index].state = state
+            if !text.isEmpty { tasks[index].text = text }
+        } else {
+            tasks.insert(TaskRow(id: id, instruction: instruction, state: state, text: text), at: 0)
+        }
+        selectedID = id
+        status = "Connected. The coordinator accepted the task."
     }
 
     func approve(hash: String) {
@@ -116,12 +221,18 @@ final class AppModel {
             speaking = false
             if let id = selectedID, let index = tasks.firstIndex(where: { $0.id == id }) {
                 tasks[index].state = "cancelled"
+                if connected, let link { link.interrupt(taskID: id) }
             }
             status = "Stop reached the execution coordinator."
         case .listening:
             speaking = false
             listening = false
         }
+    }
+
+    private func clipped(_ text: String) -> String {
+        if text.count <= 42 { return text }
+        return String(text.prefix(42)) + "…"
     }
 }
 
@@ -130,114 +241,4 @@ struct TaskRow: Identifiable, Equatable {
     var instruction: String
     var state: String
     var text: String
-}
-
-struct ContentView: View {
-    @Bindable var model: AppModel
-    @State private var instruction = ""
-
-    var body: some View {
-        NavigationSplitView {
-            List(model.tasks, selection: $model.selectedID) { task in
-                VStack(alignment: .leading) {
-                    Text(task.instruction).lineLimit(2)
-                    Text(task.state).font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            .navigationTitle("Tasks")
-        } detail: {
-            VStack(alignment: .leading, spacing: 16) {
-                composer
-                if model.schemaError {
-                    Text("This event schema is not supported.")
-                        .foregroundStyle(.red)
-                }
-                if let task = model.selected {
-                    TaskDetail(task: task)
-                } else {
-                    Text("Submit an instruction to start a task.")
-                        .foregroundStyle(.secondary)
-                }
-                limitations
-            }
-            .padding(20)
-        }
-    }
-
-    private var composer: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            TextField("Instruction", text: $instruction)
-                .textFieldStyle(.roundedBorder)
-            HStack {
-                Button("Submit") {
-                    model.submit(instruction: instruction, consequential: false)
-                    instruction = ""
-                }
-                Button(model.listening ? "Listening" : "Push to talk") { model.listening.toggle() }
-                Button("Stop playback") { model.stop(.playback) }
-                Button("Stop run") { model.stop(.run) }
-                Button("Stop listening") { model.stop(.listening) }
-            }
-            TextField("Transcript", text: $model.transcript)
-                .textFieldStyle(.roundedBorder)
-            Toggle("Transcript reviewed", isOn: $model.transcriptReviewed)
-            Text(model.wakeWordAvailable ? "Wake word on" : "Wake word unavailable. Use text or push-to-talk.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(model.status).font(.caption)
-        }
-    }
-
-    private var limitations: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Known limitations").font(.headline)
-            ForEach(knownLimitations, id: \.self) { item in
-                Text("• \(item)").font(.caption)
-            }
-        }
-    }
-}
-
-struct TaskDetail: View {
-    let task: TaskRow
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(task.instruction).font(.title3)
-            Text(task.state).font(.headline)
-            if task.state == "succeeded" {
-                Text("Result").font(.headline)
-                Text(task.text.isEmpty ? "Verified outcome recorded." : task.text)
-            } else if task.state == "waiting_approval" {
-                ReviewCard(message: "The exact payload is shown here and cannot be edited into a different action.")
-            } else if task.state == "waiting_input" {
-                Text("Clarification").font(.headline)
-                Text("Answer the outstanding question. One answer is sent for the request id.")
-            } else if task.state == "blocked" || task.state == "failed" {
-                Text("Blocked").font(.headline)
-                Text(task.text.isEmpty ? "The coordinator stopped this task." : task.text)
-            } else {
-                Text(task.text).textSelection(.enabled)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-struct ReviewCard: View {
-    let message: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Review").font(.headline)
-            Text(message)
-            HStack {
-                Button("Approve") {}
-                Button("Reject") {}
-            }
-        }
-        .padding(12)
-        .background(.quaternary.opacity(0.4))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
 }

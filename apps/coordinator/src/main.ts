@@ -28,6 +28,7 @@ const service = new CoordinatorService(store, hermes, {
 });
 const port = Number(process.env.PERMAC_PORT ?? 8788);
 const server = await listen(service, token, port);
+writeFileSync(join(dataDir, "port"), String(server.port), { mode: 0o600 });
 console.log(`permac coordinator listening on 127.0.0.1:${server.port}`);
 
 function configureHermesMemory(home: string): void {

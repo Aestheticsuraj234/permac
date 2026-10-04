@@ -31,6 +31,10 @@ export function listen(service: CoordinatorService, token: string, port = 0): Pr
       }
     });
     socket.on("close", () => clients.delete(socket));
+    socket.on("error", () => {
+      clients.delete(socket);
+      socket.destroy();
+    });
 
     const handleLine = (line: string) => {
       if (!line.trim()) return;

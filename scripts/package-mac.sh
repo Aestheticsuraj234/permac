@@ -8,8 +8,10 @@ swift build --package-path apps/macos --configuration release
 bin=$(swift build --package-path apps/macos --configuration release --show-bin-path)/Permac
 app="$root/dist/Permac.app"
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/Permac"
+cp "$root/apps/macos/Resources/Logo.png" "$app/Contents/Resources/Logo.png"
+cp "$root/apps/macos/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 cat > "$app/Contents/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -18,6 +20,8 @@ cat > "$app/Contents/Info.plist" << 'EOF'
   <key>CFBundleExecutable</key><string>Permac</string>
   <key>CFBundleIdentifier</key><string>local.permac.agent</string>
   <key>CFBundleName</key><string>Permac</string>
+  <key>CFBundleDisplayName</key><string>Permac</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>

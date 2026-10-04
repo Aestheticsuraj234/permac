@@ -58,11 +58,13 @@ public struct Envelope: Decodable, Equatable, Sendable {
 public struct TaskProjection: Equatable, Sendable {
     public var state: String
     public var text: String
+    public var instruction: String
     public var actions: [String: String]
 
-    public init(state: String = "queued", text: String = "", actions: [String: String] = [:]) {
+    public init(state: String = "queued", text: String = "", instruction: String = "", actions: [String: String] = [:]) {
         self.state = state
         self.text = text
+        self.instruction = instruction
         self.actions = actions
     }
 }
@@ -123,8 +125,11 @@ public enum Ingest {
     private static func apply(_ event: Envelope, to projection: inout Projection) {
         var task = projection.tasks[event.taskId] ?? TaskProjection()
         switch event.type {
+        case "task.created":
+            if let instruction = event.payload["instruction"]?.string { task.instruction = instruction }
         case "task.state_changed":
             if let state = event.payload["to"]?.string { task.state = state }
+            if let error = event.payload["error"]?.string { task.text = error }
         case "message.delta":
             if let text = event.payload["text"]?.string { task.text += text }
         case "tool.started":
