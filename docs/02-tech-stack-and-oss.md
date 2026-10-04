@@ -13,7 +13,7 @@ This document names what we write and which open-source codebases we run or adap
 | Minimum OS | macOS 14 | Raised only if the Hermes or cua-driver audit requires it |
 | Coordinator | TypeScript, Node 24 LTS, pnpm | Tasks, approvals, event journal, leases, policy, recovery |
 | Contracts | One schema in `packages/contracts` | TypeScript validates; Swift decodes the same names. Unknown `schema_version` fails closed |
-| Harness database | SQLite with migrations | Task state, actions, approvals, grants, leases, journal |
+| Harness database | Postgres (`pg`) | Task state, actions, approvals, grants, leases, journal, and an append-only activity log |
 | App to coordinator | Authenticated local socket, newline-delimited JSON | Commands in, journal events out |
 | Coordinator to Hermes | JSON-RPC 2.0 over stdio | TUI gateway. Loopback HTTP only if the pinned release forces it, and only with a token, size limit, and protocol version |
 | Secrets | macOS Keychain | Broker for app secrets. Model provider keys stay in the Hermes profile |
@@ -62,7 +62,7 @@ Diagnostics go through `hermes computer-use doctor`. Accessibility and Screen Re
 | `apps/mobile` | Exclude. React, Expo, and CopilotKit view code |
 | `apps/computer` | Exclude. Linux workspace image. It does not operate this Mac and does not supply the UI |
 
-CopilotKit Intelligence is not the local thread store. Removing its environment variable is not enough. Local history is the harness SQLite journal.
+CopilotKit Intelligence is not the thread store. Removing its environment variable is not enough. History is the Postgres journal.
 
 ## 3 Upstream code we do not adopt as our own product
 
@@ -75,7 +75,7 @@ CopilotKit Intelligence is not the local thread store. Removing its environment 
 
 Kept small on purpose.
 
-- TypeScript workspace: `typescript`, `zod` for contract validation, `tsx` for running the coordinator and tests. SQLite comes from Node’s built-in `node:sqlite` so the harness does not add a native database addon.
+- TypeScript workspace: `typescript`, `zod` for contract validation, `tsx` for running the coordinator and tests, `pg` for Postgres, and `supermemory` for remote memory. Agent memory is not stored in a local file.
 - Swift app: SwiftUI and AppKit from the macOS SDK only. No third-party UI kit.
 
 Anything else requires a note in the vendor manifest and a reason tied to a milestone.

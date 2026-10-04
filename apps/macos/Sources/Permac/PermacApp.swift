@@ -4,21 +4,51 @@ import PermacCore
 
 @main
 struct PermacApp: App {
-    @State private var model = AppModel()
+    @NSApplicationDelegateAdaptor(PermacDelegate.self) private var delegate
+    @State private var model = AppModel.shared
 
     var body: some Scene {
+        Window("Permac", id: "main") {
+            ContentView(model: model)
+                .frame(minWidth: 760, minHeight: 520)
+        }
         MenuBarExtra("Permac", systemImage: "sparkles") {
-            Button("Open") { NSApp.activate(ignoringOtherApps: true) }
+            Button("Open") { PermacDelegate.presentMainWindow() }
             Divider()
             Text(model.listening ? "Listening" : "Idle")
             Button("Stop") { model.stop(.run) }
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
         }
-        Window("Permac", id: "main") {
-            ContentView(model: model)
-                .frame(minWidth: 760, minHeight: 520)
+    }
+}
+
+@MainActor
+final class PermacDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        DispatchQueue.main.async {
+            Self.presentMainWindow()
         }
+    }
+
+    static func presentMainWindow() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        let visible = NSApp.windows.filter { $0.canBecomeKey && $0.isVisible }
+        if let window = visible.first {
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Permac"
+        window.contentView = NSHostingView(rootView: ContentView(model: AppModel.shared))
+        window.center()
+        window.makeKeyAndOrderFront(nil)
     }
 }
 
@@ -31,6 +61,7 @@ enum StopKind {
 @MainActor
 @Observable
 final class AppModel {
+    static let shared = AppModel()
     var tasks: [TaskRow] = []
     var selectedID: String?
     var transcript = ""

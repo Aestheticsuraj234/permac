@@ -1,7 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { Pool, type QueryResultRow } from "pg";
 import {
   SCHEMA_VERSION,
   type ActionState,
@@ -10,8 +8,9 @@ import {
   type TaskSource,
   type TaskState,
 } from "../../contracts/src/index.ts";
+import type { Grant, Lease } from "../../policy/src/index.ts";
 
-const migration = `
+const tables = `
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   session_id TEXT,
@@ -57,15 +56,14 @@ CREATE TABLE IF NOT EXISTS grants (
   target TEXT NOT NULL,
   capability TEXT NOT NULL,
   operation TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  revoked_at TEXT
+  expires_at BIGINT NOT NULL,
+  revoked_at BIGINT
 );
 CREATE TABLE IF NOT EXISTS leases (
   id TEXT PRIMARY KEY,
   owner_task_id TEXT NOT NULL,
   fencing_generation INTEGER NOT NULL,
-  expires_at TEXT NOT NULL,
-  heartbeat_at TEXT NOT NULL
+  expires_at BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
   event_id TEXT PRIMARY KEY,
@@ -74,14 +72,34 @@ CREATE TABLE IF NOT EXISTS events (
   schema_version INTEGER NOT NULL,
   timestamp TEXT NOT NULL,
   type TEXT NOT NULL,
-  payload TEXT NOT NULL,
+  payload JSONB NOT NULL,
   UNIQUE(task_id, sequence)
+);
+CREATE TABLE IF NOT EXISTS activity_log (
+  id BIGSERIAL PRIMARY KEY,
+  at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  kind TEXT NOT NULL,
+  task_id TEXT,
+  detail JSONB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS preferences (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 `;
+
+const pools = new Map<string, Pool>();
+
+function connectionString(): string {
+  const url = process.env.DATABASE_URL;
+  if (!url) throw new Error("DATABASE_URL is required. Postgres is the only harness store.");
+  return url;
+}
+
+function schemaName(schema: string): string {
+  if (!/^[a-z_][a-z0-9_]*$/.test(schema)) throw new Error("Invalid Postgres schema name");
+  return schema;
+}
 
 export interface TaskRecord {
   id: string;
@@ -114,32 +132,84 @@ export interface ActionRecord {
   idempotency_key: string | null;
 }
 
-export class HarnessStore {
-  constructor(private readonly db: DatabaseSync) {}
+export interface ActivityLogRow {
+  kind: string;
+  task_id: string | null;
+  detail: Record<string, unknown>;
+}
 
-  static open(path: string): HarnessStore {
-    if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-    const db = new DatabaseSync(path);
-    try {
-      db.exec("PRAGMA journal_mode = WAL");
-    } catch {
-      // In-memory databases reject WAL. The default journal is enough there.
+export class HarnessStore {
+  private constructor(
+    private readonly pool: Pool,
+    private readonly schema: string,
+    private readonly poolKey: string,
+  ) {}
+
+  static async open(options?: { schema?: string; reset?: boolean }): Promise<HarnessStore> {
+    const schema = schemaName(options?.schema ?? process.env.PERMAC_SCHEMA ?? "permac");
+    const key = `${connectionString()}::${schema}`;
+    let pool = pools.get(key);
+    if (!pool) {
+      pool = new Pool({ connectionString: connectionString(), max: 2 });
+      pools.set(key, pool);
     }
-    db.exec(migration);
-    const store = new HarnessStore(db);
-    store.reconcileExecutingActions();
+    const store = new HarnessStore(pool, schema, key);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
+      await client.query(`SET LOCAL search_path TO ${schema}`);
+      await client.query(tables);
+      if (options?.reset) {
+        await client.query(
+          "TRUNCATE tasks, actions, approvals, grants, leases, events, activity_log, preferences",
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    await store.reconcileExecutingActions();
     return store;
   }
 
-  close(): void {
-    this.db.close();
+  close(): void {}
+
+  async dropSchema(): Promise<void> {
+    if (this.schema === "permac") throw new Error("Refusing to drop the application schema");
+    const client = await this.pool.connect();
+    try {
+      await client.query(`DROP SCHEMA IF EXISTS ${this.schema} CASCADE`);
+    } finally {
+      client.release();
+    }
+    pools.delete(this.poolKey);
+    await this.pool.end();
   }
 
-  createTask(input: {
-    instruction: string;
-    source: TaskSource;
-    now: string;
-  }): TaskRecord {
+  async recordLog(kind: string, taskId: string | null, detail: Record<string, unknown>): Promise<void> {
+    await this.query(
+      "INSERT INTO activity_log (kind, task_id, detail) VALUES ($1, $2, $3::jsonb)",
+      [kind, taskId, JSON.stringify(detail)],
+    );
+  }
+
+  async recentLogs(limit = 50): Promise<ActivityLogRow[]> {
+    const result = await this.query<ActivityLogRow>(
+      "SELECT kind, task_id, detail FROM activity_log ORDER BY id DESC LIMIT $1",
+      [limit],
+    );
+    return result.rows.map((row) => ({
+      kind: row.kind,
+      task_id: row.task_id,
+      detail: typeof row.detail === "string" ? (JSON.parse(row.detail) as Record<string, unknown>) : row.detail,
+    }));
+  }
+
+  async createTask(input: { instruction: string; source: TaskSource; now: string }): Promise<TaskRecord> {
     const task: TaskRecord = {
       id: randomUUID(),
       session_id: null,
@@ -155,12 +225,10 @@ export class HarnessStore {
       cancellation_requested_at: null,
       error: null,
     };
-    this.db
-      .prepare(
-        `INSERT INTO tasks (id, session_id, engine_run_id, instruction, source, state, created_at, updated_at, current_step, attempt, last_event_sequence, cancellation_requested_at, error)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    await this.query(
+      `INSERT INTO tasks (id, session_id, engine_run_id, instruction, source, state, created_at, updated_at, current_step, attempt, last_event_sequence, cancellation_requested_at, error)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [
         task.id,
         task.session_id,
         task.engine_run_id,
@@ -174,18 +242,18 @@ export class HarnessStore {
         task.last_event_sequence,
         task.cancellation_requested_at,
         task.error,
-      );
+      ],
+    );
+    await this.recordLog("task.insert", task.id, { instruction: task.instruction, source: task.source });
     return task;
   }
 
-  updateTask(id: string, patch: Partial<TaskRecord>): TaskRecord {
-    const current = this.getTask(id);
+  async updateTask(id: string, patch: Partial<TaskRecord>): Promise<TaskRecord> {
+    const current = await this.getTask(id);
     const next = { ...current, ...patch, id: current.id };
-    this.db
-      .prepare(
-        `UPDATE tasks SET session_id=?, engine_run_id=?, instruction=?, source=?, state=?, updated_at=?, current_step=?, attempt=?, last_event_sequence=?, cancellation_requested_at=?, error=? WHERE id=?`,
-      )
-      .run(
+    await this.query(
+      `UPDATE tasks SET session_id=$1, engine_run_id=$2, instruction=$3, source=$4, state=$5, updated_at=$6, current_step=$7, attempt=$8, last_event_sequence=$9, cancellation_requested_at=$10, error=$11 WHERE id=$12`,
+      [
         next.session_id,
         next.engine_run_id,
         next.instruction,
@@ -198,27 +266,29 @@ export class HarnessStore {
         next.cancellation_requested_at,
         next.error,
         id,
-      );
+      ],
+    );
+    await this.recordLog("task.update", id, { state: next.state, error: next.error });
     return next;
   }
 
-  getTask(id: string): TaskRecord {
-    const row = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as TaskRecord | undefined;
+  async getTask(id: string): Promise<TaskRecord> {
+    const result = await this.query<TaskRecord>("SELECT * FROM tasks WHERE id = $1", [id]);
+    const row = result.rows[0];
     if (!row) throw new Error(`Task ${id} not found`);
-    return row;
+    return normalizeTask(row);
   }
 
-  listTasks(): TaskRecord[] {
-    return this.db.prepare("SELECT * FROM tasks ORDER BY created_at").all() as unknown as TaskRecord[];
+  async listTasks(): Promise<TaskRecord[]> {
+    const result = await this.query<TaskRecord>("SELECT * FROM tasks ORDER BY created_at");
+    return result.rows.map(normalizeTask);
   }
 
-  insertAction(action: ActionRecord): void {
-    this.db
-      .prepare(
-        `INSERT INTO actions (id, task_id, tool, target, payload_hash, state, approval_id, started_at, completed_at, verification, evidence_reference, idempotency_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+  async insertAction(action: ActionRecord): Promise<void> {
+    await this.query(
+      `INSERT INTO actions (id, task_id, tool, target, payload_hash, state, approval_id, started_at, completed_at, verification, evidence_reference, idempotency_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [
         action.id,
         action.task_id,
         action.tool,
@@ -231,59 +301,66 @@ export class HarnessStore {
         action.verification,
         action.evidence_reference,
         action.idempotency_key,
-      );
+      ],
+    );
+    await this.recordLog("action.insert", action.task_id, { action_id: action.id, tool: action.tool, target: action.target });
   }
 
-  updateAction(id: string, patch: Partial<ActionRecord>): ActionRecord {
-    const current = this.getAction(id);
+  async updateAction(id: string, patch: Partial<ActionRecord>): Promise<ActionRecord> {
+    const current = await this.getAction(id);
     const next = { ...current, ...patch, id };
-    this.db
-      .prepare(
-        `UPDATE actions SET state=?, approval_id=?, started_at=?, completed_at=?, verification=?, evidence_reference=? WHERE id=?`,
-      )
-      .run(
-        next.state,
-        next.approval_id,
-        next.started_at,
-        next.completed_at,
-        next.verification,
-        next.evidence_reference,
-        id,
-      );
+    await this.query(
+      `UPDATE actions SET state=$1, approval_id=$2, started_at=$3, completed_at=$4, verification=$5, evidence_reference=$6 WHERE id=$7`,
+      [next.state, next.approval_id, next.started_at, next.completed_at, next.verification, next.evidence_reference, id],
+    );
+    await this.recordLog("action.update", next.task_id, { action_id: id, state: next.state });
     return next;
   }
 
-  getAction(id: string): ActionRecord {
-    const row = this.db.prepare("SELECT * FROM actions WHERE id = ?").get(id) as ActionRecord | undefined;
+  async getAction(id: string): Promise<ActionRecord> {
+    const result = await this.query<ActionRecord>("SELECT * FROM actions WHERE id = $1", [id]);
+    const row = result.rows[0];
     if (!row) throw new Error(`Action ${id} not found`);
     return row;
   }
 
-  findByIdempotency(key: string): ActionRecord | undefined {
-    return this.db.prepare("SELECT * FROM actions WHERE idempotency_key = ?").get(key) as
-      | ActionRecord
-      | undefined;
+  async findByIdempotency(key: string): Promise<ActionRecord | undefined> {
+    const result = await this.query<ActionRecord>("SELECT * FROM actions WHERE idempotency_key = $1", [key]);
+    return result.rows[0];
   }
 
-  reconcileExecutingActions(): number {
-    const result = this.db
-      .prepare(
-        `UPDATE actions SET state = 'unknown', verification = 'unknown' WHERE state = 'executing'`,
-      )
-      .run();
-    return Number(result.changes);
+  async findActionByTarget(taskId: string, target: string): Promise<ActionRecord | undefined> {
+    const result = await this.query<ActionRecord>(
+      "SELECT * FROM actions WHERE task_id = $1 AND target = $2 ORDER BY started_at DESC NULLS LAST LIMIT 1",
+      [taskId, target],
+    );
+    return result.rows[0];
   }
 
-  appendEvent(input: {
+  async reconcileExecutingActions(): Promise<number> {
+    const result = await this.query(
+      "UPDATE actions SET state = 'unknown', verification = 'unknown' WHERE state = 'executing'",
+    );
+    if ((result.rowCount ?? 0) > 0) {
+      await this.recordLog("action.reconcile", null, { count: result.rowCount });
+    }
+    return result.rowCount ?? 0;
+  }
+
+  async appendEvent(input: {
     taskId: string;
     type: EventType;
     payload: Record<string, unknown>;
     now: string;
-  }): Envelope {
-    this.db.exec("BEGIN");
+  }): Promise<Envelope> {
+    const client = await this.pool.connect();
     try {
-      const task = this.getTask(input.taskId);
-      const sequence = task.last_event_sequence + 1;
+      await client.query("BEGIN");
+      await client.query(`SET LOCAL search_path TO ${this.schema}`);
+      const current = await client.query<TaskRecord>("SELECT * FROM tasks WHERE id = $1", [input.taskId]);
+      const task = current.rows[0];
+      if (!task) throw new Error(`Task ${input.taskId} not found`);
+      const sequence = Number(task.last_event_sequence) + 1;
       const event: Envelope = {
         schema_version: SCHEMA_VERSION,
         event_id: randomUUID(),
@@ -293,99 +370,169 @@ export class HarnessStore {
         type: input.type,
         payload: input.payload,
       };
-      this.db
-        .prepare(
-          `INSERT INTO events (event_id, task_id, sequence, schema_version, timestamp, type, payload)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          event.event_id,
-          event.task_id,
-          event.sequence,
-          event.schema_version,
-          event.timestamp,
-          event.type,
-          JSON.stringify(event.payload),
-        );
-      this.db
-        .prepare("UPDATE tasks SET last_event_sequence = ?, updated_at = ? WHERE id = ?")
-        .run(sequence, input.now, input.taskId);
-      this.db.exec("COMMIT");
+      await client.query(
+        `INSERT INTO events (event_id, task_id, sequence, schema_version, timestamp, type, payload)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+        [event.event_id, event.task_id, event.sequence, event.schema_version, event.timestamp, event.type, JSON.stringify(event.payload)],
+      );
+      await client.query("UPDATE tasks SET last_event_sequence = $1, updated_at = $2 WHERE id = $3", [
+        sequence,
+        input.now,
+        input.taskId,
+      ]);
+      await client.query(
+        "INSERT INTO activity_log (kind, task_id, detail) VALUES ($1, $2, $3::jsonb)",
+        ["event.append", input.taskId, JSON.stringify({ type: input.type, sequence, event_id: event.event_id })],
+      );
+      await client.query("COMMIT");
       return event;
     } catch (error) {
-      this.db.exec("ROLLBACK");
+      await client.query("ROLLBACK");
       throw error;
+    } finally {
+      client.release();
     }
   }
 
-  eventsAfter(taskId: string, afterSequence: number): Envelope[] {
-    const rows = this.db
-      .prepare(
-        "SELECT * FROM events WHERE task_id = ? AND sequence > ? ORDER BY sequence",
-      )
-      .all(taskId, afterSequence) as unknown as Array<{
+  async eventsAfter(taskId: string, afterSequence: number): Promise<Envelope[]> {
+    const result = await this.query<{
       event_id: string;
       task_id: string;
       sequence: number;
-      schema_version: number;
       timestamp: string;
       type: EventType;
-      payload: string;
-    }>;
-    return rows.map((row) => ({
+      payload: Record<string, unknown> | string;
+    }>("SELECT * FROM events WHERE task_id = $1 AND sequence > $2 ORDER BY sequence", [taskId, afterSequence]);
+    return result.rows.map((row) => ({
       schema_version: SCHEMA_VERSION,
       event_id: row.event_id,
       task_id: row.task_id,
-      sequence: row.sequence,
+      sequence: Number(row.sequence),
       timestamp: row.timestamp,
       type: row.type,
-      payload: JSON.parse(row.payload) as Record<string, unknown>,
+      payload: typeof row.payload === "string" ? (JSON.parse(row.payload) as Record<string, unknown>) : row.payload,
     }));
   }
 
-  insertApproval(row: {
+  async insertApproval(row: {
     id: string;
     action_id: string;
     exact_payload_hash: string;
     scope: string;
     requested_at: string;
     expires_at: string;
-  }): void {
-    this.db
-      .prepare(
-        `INSERT INTO approvals (id, action_id, exact_payload_hash, scope, requested_at, expires_at, resolved_at, decision, resolving_user)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
-      )
-      .run(row.id, row.action_id, row.exact_payload_hash, row.scope, row.requested_at, row.expires_at);
+  }): Promise<void> {
+    await this.query(
+      `INSERT INTO approvals (id, action_id, exact_payload_hash, scope, requested_at, expires_at, resolved_at, decision, resolving_user)
+       VALUES ($1,$2,$3,$4,$5,$6,NULL,NULL,NULL)`,
+      [row.id, row.action_id, row.exact_payload_hash, row.scope, row.requested_at, row.expires_at],
+    );
+    await this.recordLog("approval.insert", null, { approval_id: row.id, action_id: row.action_id });
   }
 
-  getApproval(id: string): {
+  async getApproval(id: string): Promise<{
     id: string;
     action_id: string;
     exact_payload_hash: string;
     scope: string;
     expires_at: string;
     decision: string | null;
-  } {
-    const row = this.db.prepare("SELECT * FROM approvals WHERE id = ?").get(id) as
-      | {
-          id: string;
-          action_id: string;
-          exact_payload_hash: string;
-          scope: string;
-          expires_at: string;
-          decision: string | null;
-        }
-      | undefined;
+  }> {
+    const result = await this.query<{
+      id: string;
+      action_id: string;
+      exact_payload_hash: string;
+      scope: string;
+      expires_at: string;
+      decision: string | null;
+    }>("SELECT * FROM approvals WHERE id = $1", [id]);
+    const row = result.rows[0];
     if (!row) throw new Error(`Approval ${id} not found`);
     return row;
   }
 
-  resolveApproval(id: string, decision: "approved" | "rejected", now: string, user: string): void {
-    this.db
-      .prepare(
-        "UPDATE approvals SET decision = ?, resolved_at = ?, resolving_user = ? WHERE id = ?",
-      )
-      .run(decision, now, user, id);
+  async resolveApproval(id: string, decision: "approved" | "rejected", now: string, user: string): Promise<void> {
+    await this.query(
+      "UPDATE approvals SET decision = $1, resolved_at = $2, resolving_user = $3 WHERE id = $4",
+      [decision, now, user, id],
+    );
+    await this.recordLog("approval.resolve", null, { approval_id: id, decision, user });
   }
+
+  async insertGrant(grant: Grant): Promise<void> {
+    await this.query(
+      `INSERT INTO grants (id, target, capability, operation, expires_at, revoked_at) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [grant.id, grant.target, grant.capability, grant.operation, grant.expiresAt, grant.revokedAt ?? null],
+    );
+    await this.recordLog("grant.insert", null, { grant_id: grant.id, target: grant.target, capability: grant.capability });
+  }
+
+  async listGrants(): Promise<Grant[]> {
+    const result = await this.query<{
+      id: string;
+      target: string;
+      capability: string;
+      operation: string;
+      expires_at: string;
+      revoked_at: string | null;
+    }>("SELECT * FROM grants");
+    return result.rows.map((row) => ({
+      id: row.id,
+      target: row.target,
+      capability: row.capability,
+      operation: row.operation,
+      expiresAt: Number(row.expires_at),
+      revokedAt: row.revoked_at === null ? undefined : Number(row.revoked_at),
+    }));
+  }
+
+  async revokeGrant(id: string, revokedAt: number): Promise<void> {
+    const result = await this.query("UPDATE grants SET revoked_at = $1 WHERE id = $2", [revokedAt, id]);
+    if ((result.rowCount ?? 0) === 0) throw new Error("Grant not found");
+    await this.recordLog("grant.revoke", null, { grant_id: id });
+  }
+
+  async readLease(): Promise<Lease | undefined> {
+    const result = await this.query<{
+      owner_task_id: string;
+      fencing_generation: number;
+      expires_at: string;
+    }>("SELECT * FROM leases WHERE id = 'desktop'");
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      ownerTaskId: row.owner_task_id,
+      fencingGeneration: Number(row.fencing_generation),
+      expiresAt: Number(row.expires_at),
+    };
+  }
+
+  async writeLease(lease: Lease): Promise<void> {
+    await this.query(
+      `INSERT INTO leases (id, owner_task_id, fencing_generation, expires_at) VALUES ('desktop', $1, $2, $3)
+       ON CONFLICT (id) DO UPDATE SET owner_task_id = EXCLUDED.owner_task_id, fencing_generation = EXCLUDED.fencing_generation, expires_at = EXCLUDED.expires_at`,
+      [lease.ownerTaskId, lease.fencingGeneration, lease.expiresAt],
+    );
+    await this.recordLog("lease.write", lease.ownerTaskId, { fencing_generation: lease.fencingGeneration });
+  }
+
+  private async query<T extends QueryResultRow = QueryResultRow>(text: string, values: unknown[] = []) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`SET LOCAL search_path TO ${this.schema}`);
+      const result = await client.query<T>(text, values);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+}
+
+function normalizeTask(row: TaskRecord): TaskRecord {
+  return { ...row, attempt: Number(row.attempt), last_event_sequence: Number(row.last_event_sequence) };
 }

@@ -21,8 +21,9 @@ Hermes       --MCP stdio------------------->  cua-driver (this Mac only)
 
 | Data | Owner | Others may |
 |---|---|---|
-| Agent session, memory, skills | Hermes SQLite under the Hermes profile | Read through the adapter API. Never write the tables |
-| Task, action, approval, grant, lease, journal, UI preferences | Coordinator SQLite | SwiftUI reads events. It does not write the file |
+| Agent session and skills | Hermes profile | Read through the adapter API. Never write Hermes tables. Built-in MEMORY.md and USER.md stay off |
+| Agent memory | Supermemory, through the official SDK | No local memory file. A missing API key is logged in Postgres and nothing is stored |
+| Task, action, approval, grant, lease, journal, activity log | Postgres schema `permac` | SwiftUI reads events. It does not write the database |
 | Screen projection | SwiftUI memory | Dropped on reconnect; rebuilt by replaying the journal |
 
 Restart loads the coordinator database, reconciles leases, and marks actions that were `executing` as `unknown` until checked. Read-only work may be recovered when the check is safe. External writes wait for reconciliation. The app does not claim the model inference itself resumed.
@@ -79,7 +80,8 @@ The app does not lock the keyboard. If observation shows the intended target cha
 | `packages/policy` | Grants, approval binding, admission |
 | `packages/mac-tools` | Registered app tools and the native helper client |
 | `packages/verification` | Result checks |
-| `packages/storage` | SQLite schema and migrations |
+| `packages/storage` | Postgres schema, journal, and activity log |
+| `packages/memory` | Supermemory SDK client |
 | `packages/messaging` | WhatsApp desktop workflow |
 | `packages/voice` | Push-to-talk, playback, wake-word gate |
 | `tests/contracts` | Protocol fixtures and replay |

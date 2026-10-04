@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "node:net";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { CoordinatorService } from "../../apps/coordinator/src/service.ts";
 import { listen } from "../../apps/coordinator/src/server.ts";
 import type { EngineEvent, HermesAdapter, RequestAnswer, RunRef, SessionRef } from "../../packages/hermes-adapter/src/index.ts";
@@ -12,6 +13,15 @@ import { HarnessStore } from "../../packages/storage/src/index.ts";
 import { runWhatsAppSend, type WhatsAppDriver } from "../../packages/messaging/src/whatsapp.ts";
 import { applyStop, decideVoiceInput } from "../../packages/voice/src/index.ts";
 import { missedSchedule, optionalToolEnabled, runRoutine } from "../../packages/schedule/src/index.ts";
+
+async function waitFor(check: () => Promise<boolean>, timeoutMs = 90_000): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("Timed out waiting for coordinator state");
+}
 
 class Queue<T> {
   private items: T[] = [];
@@ -77,11 +87,15 @@ class FakeHermes implements HermesAdapter {
   }
 }
 
-function service(hermes = new FakeHermes(), runnerCode = 0) {
-  const store = HarnessStore.open(":memory:");
+async function service(t: TestContext, hermes = new FakeHermes(), runnerCode = 0) {
+  const store = await HarnessStore.open({ schema: `t${randomBytes(4).toString("hex")}`, reset: true });
+  t.after(async () => {
+    await store.dropSchema();
+  });
   const coordinator = new CoordinatorService(store, hermes, {
     registry: ["Cursor", "TextEdit"],
     roots: ["/Users/me/Documents"],
+    leaseTtlMs: 10 * 60 * 1000,
     runner: {
       async run(command: string, args: string[]) {
         if (args.includes("Missing")) return { code: 1, stdout: "", stderr: "missing" };
@@ -95,16 +109,18 @@ function service(hermes = new FakeHermes(), runnerCode = 0) {
   return { store, coordinator, hermes };
 }
 
-test("restart keeps tasks and marks executing actions unknown", () => {
-  const dir = mkdtempSync(join(tmpdir(), "permac-db-"));
-  const path = join(dir, "harness.sqlite");
-  const first = HarnessStore.open(path);
-  const task = first.createTask({
+test("restart keeps tasks and marks executing actions unknown", async (t) => {
+  const schema = `t${randomBytes(4).toString("hex")}`;
+  const first = await HarnessStore.open({ schema, reset: true });
+  t.after(async () => {
+    await first.dropSchema();
+  });
+  const task = await first.createTask({
     instruction: "remember",
     source: "text",
     now: "2026-10-04T00:00:00.000Z",
   });
-  first.insertAction({
+  await first.insertAction({
     id: "act",
     task_id: task.id,
     tool: "send_message",
@@ -118,22 +134,25 @@ test("restart keeps tasks and marks executing actions unknown", () => {
     evidence_reference: null,
     idempotency_key: null,
   });
-  first.appendEvent({
+  await first.appendEvent({
     taskId: task.id,
     type: "task.created",
     payload: { instruction: "remember" },
     now: "2026-10-04T00:00:01.000Z",
   });
   first.close();
-  const second = HarnessStore.open(path);
-  assert.equal(second.getTask(task.id).instruction, "remember");
-  assert.equal(second.getAction("act").state, "unknown");
-  assert.equal(second.eventsAfter(task.id, 0).length, 1);
+  const second = await HarnessStore.open({ schema });
+  assert.equal((await second.getTask(task.id)).instruction, "remember");
+  assert.equal((await second.getAction("act")).state, "unknown");
+  assert.equal((await second.eventsAfter(task.id, 0)).length, 1);
+  const logs = await second.recentLogs(20);
+  assert.ok(logs.some((row) => row.kind === "task.insert"));
+  assert.ok(logs.some((row) => row.kind === "action.reconcile"));
   second.close();
 });
 
-test("workflows open an app, block a missing app, and find a granted file", async () => {
-  const { coordinator } = service();
+test("workflows open an app, block a missing app, and find a granted file", async (t) => {
+  const { coordinator } = await service(t);
   const opened = await coordinator.runWorkflow("open_app", "Cursor");
   assert.equal(opened.state, "succeeded");
   const missing = await coordinator.runWorkflow("open_app", "Missing");
@@ -142,12 +161,13 @@ test("workflows open an app, block a missing app, and find a granted file", asyn
     entries: ["/Users/me/Documents/notes.txt", "/Users/me/Documents/.ssh/id_rsa", "/tmp/notes.txt"],
   });
   assert.equal(found.state, "succeeded");
-  assert.match(coordinator.eventsAfter(found.id, 0).at(-1)?.payload.evidence as string, /notes.txt/);
-  assert.doesNotMatch(String(coordinator.eventsAfter(found.id, 0).at(-1)?.payload.evidence), /id_rsa/);
+  const events = await coordinator.eventsAfter(found.id, 0);
+  assert.match(events.at(-1)?.payload.evidence as string, /notes.txt/);
+  assert.doesNotMatch(String(events.at(-1)?.payload.evidence), /id_rsa/);
 });
 
-test("two desktop workflows cannot share the lease", async () => {
-  const { coordinator } = service();
+test("two desktop workflows cannot share the lease", async (t) => {
+  const { coordinator } = await service(t);
   const first = await coordinator.runWorkflow("open_app", "Cursor");
   assert.equal(first.state, "succeeded");
   const second = await coordinator.runWorkflow("open_app", "TextEdit");
@@ -155,22 +175,22 @@ test("two desktop workflows cannot share the lease", async () => {
   assert.match(second.error ?? "", /lease/i);
 });
 
-test("message approval binds the payload and a revoked grant does not skip review", async () => {
-  const { coordinator } = service();
-  const grant = coordinator.addGrant({
+test("message approval binds the payload and a revoked grant does not skip review", async (t) => {
+  const { coordinator, store } = await service(t);
+  const grant = await coordinator.addGrant({
     target: "ada",
     capability: "send_message",
     operation: "send_message",
     expiresAt: Date.now() + 10_000,
   });
-  coordinator.revokeGrant(grant.id);
+  await coordinator.revokeGrant(grant.id);
   const waiting = await coordinator.runWorkflow("send_message", "ada", {
     body: "hello",
     account: "me",
     recipient: "ada",
   });
   assert.equal(waiting.state, "waiting_approval");
-  const approval = coordinator.eventsAfter(waiting.id, 0).find((event) => event.type === "approval.requested");
+  const approval = (await coordinator.eventsAfter(waiting.id, 0)).find((event) => event.type === "approval.requested");
   assert.ok(approval);
   await assert.rejects(() =>
     coordinator.resolveApproval(
@@ -179,12 +199,15 @@ test("message approval binds the payload and a revoked grant does not skip revie
       "not-the-hash",
     ),
   );
-  assert.equal(coordinator.listTasks().find((task) => task.id === waiting.id)?.state, "waiting_approval");
+  assert.equal((await coordinator.listTasks()).find((task) => task.id === waiting.id)?.state, "waiting_approval");
+  const logs = await store.recentLogs(30);
+  assert.ok(logs.some((row) => row.kind === "memory.skipped"));
+  assert.ok(logs.some((row) => row.kind === "grant.revoke"));
 });
 
-test("shell stays disabled and Hermes approvals wait for the coordinator", async () => {
+test("shell stays disabled and Hermes approvals wait for the coordinator", async (t) => {
   const hermes = new FakeHermes();
-  const { coordinator } = service(hermes);
+  const { coordinator } = await service(t, hermes);
   const denied = await coordinator.runWorkflow("shell", "rm -rf");
   assert.equal(denied.state, "blocked");
   const submitted = coordinator.submitText("look around");
@@ -198,10 +221,11 @@ test("shell stays disabled and Hermes approvals wait for the coordinator", async
     command: "rm build",
     description: "delete",
   });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(coordinator.listTasks().find((item) => item.id === task.id)?.state, "waiting_approval");
+  await waitFor(async () =>
+    (await coordinator.eventsAfter(task.id, 0)).some((event) => event.type === "approval.requested"),
+  );
   assert.equal(hermes.answered.length, 0);
-  const approval = coordinator.eventsAfter(task.id, 0).find((event) => event.type === "approval.requested");
+  const approval = (await coordinator.eventsAfter(task.id, 0)).find((event) => event.type === "approval.requested");
   await coordinator.resolveApproval(
     String(approval?.payload.approval_id),
     "approved",
@@ -215,21 +239,20 @@ test("shell stays disabled and Hermes approvals wait for the coordinator", async
     name: "terminal",
     args: {},
   });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(coordinator.listTasks().find((item) => item.id === task.id)?.state, "blocked");
+  await waitFor(async () => (await coordinator.listTasks()).some((item) => item.id === task.id && item.state === "blocked"));
 });
 
-test("journal replay restores events after the last sequence", async () => {
-  const { coordinator } = service();
+test("journal replay restores events after the last sequence", async (t) => {
+  const { coordinator } = await service(t);
   const task = await coordinator.runWorkflow("open_app", "Cursor");
-  const all = coordinator.eventsAfter(task.id, 0);
-  const tail = coordinator.eventsAfter(task.id, 1);
+  const all = await coordinator.eventsAfter(task.id, 0);
+  const tail = await coordinator.eventsAfter(task.id, 1);
   assert.ok(all.length > tail.length);
   assert.equal(tail[0]?.sequence, 2);
 });
 
-test("local socket rejects a bad token, a malformed frame, and an oversized payload", async () => {
-  const { coordinator } = service();
+test("local socket rejects a bad token, a malformed frame, and an oversized payload", async (t) => {
+  const { coordinator } = await service(t);
   const server = await listen(coordinator, "secret", 0);
   const send = (payload: string) =>
     new Promise<string>((resolve, reject) => {

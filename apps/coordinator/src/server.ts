@@ -96,7 +96,7 @@ async function dispatch(
     return service.submitText(String(payload.instruction ?? ""), (payload.source as "text") ?? "text");
   }
   if (command === "task.interrupt") return service.interrupt(String(payload.task_id));
-  if (command === "task.pause") return service.pause(String(payload.task_id));
+  if (command === "task.pause") return await service.pause(String(payload.task_id));
   if (command === "approval.resolve") {
     await service.resolveApproval(
       String(payload.approval_id),
@@ -106,11 +106,11 @@ async function dispatch(
     return { ok: true };
   }
   if (command === "clarification.answer") {
-    service.answerClarification(String(payload.request_id), String(payload.answer));
+    await service.answerClarification(String(payload.request_id), String(payload.answer));
     return { ok: true };
   }
   if (command === "journal.subscribe") {
-    return service.eventsAfter(String(payload.task_id), Number(payload.after_sequence ?? 0));
+    return await service.eventsAfter(String(payload.task_id), Number(payload.after_sequence ?? 0));
   }
   if (command === "workflow.run") {
     return service.runWorkflow(String(payload.tool), String(payload.target), payload);

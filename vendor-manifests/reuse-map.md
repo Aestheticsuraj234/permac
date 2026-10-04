@@ -18,7 +18,7 @@ Audit date 2026-10-04. SHAs are in `upstream.json`.
 | OpenMuse `packages/integrations` | Defer | Google tools stay disabled |
 | OpenMuse `apps/mobile` | Exclude | React, Expo, and CopilotKit views |
 | OpenMuse `apps/computer` | Exclude | Linux workspace, not this Mac |
-| CopilotKit Intelligence thread store | Replace | Harness SQLite is the local journal |
+| CopilotKit Intelligence thread store | Replace | Postgres is the journal. Supermemory is the memory store |
 | LangGraph | Exclude | Would duplicate the Hermes loop |
 
 Unmediated toolsets (`terminal`, `browser`, `computer_use`) are disabled in the Hermes profile via `agent.disabled_toolsets`. Side effects go through coordinator executors that can be held for approval. Generic shell stays disabled rather than approved from the UI alone.
