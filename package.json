@@ -1,0 +1,22 @@
+{
+  "name": "permac",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.24.0",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "test": "node --import tsx --test tests/contracts/*.test.ts tests/workflows/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "coordinator": "tsx apps/coordinator/src/main.ts"
+  },
+  "devDependencies": {
+    "@types/node": "24.5.2",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2"
+  },
+  "dependencies": {
+    "zod": "4.1.11"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "audit_date": "2026-10-04",
+  "protocol_selection": "tui-gateway-stdio",
+  "protocol_reason": "Pinned Hermes v2026.9.24 answered ping, client.capabilities, and session.create over newline-delimited JSON-RPC on stdio. Server requests include approval and clarify. ACP and the HTTP API stay unused.",
+  "tool_interception": "Dangerous shell waits on the gateway approval server-request (tools/approval.py, request method approval). That is a real hold point. Browser, terminal, and computer_use can still run inside Hermes if those toolsets are enabled, so a UI-only policy would not cover them. This project disables those toolsets with agent.disabled_toolsets and runs Mac workflows through coordinator executors instead of patching Hermes.",
+  "hermes_test_mode": {
+    "command": "uv run --python 3.12 python -m tui_gateway.entry",
+    "home": "throwaway HERMES_HOME",
+    "observed": ["gateway.ready", "ping pong", "client.capabilities server_requests includes approval and clarify", "session.create returned a session_id"]
+  },
+  "openmuse_runtime": "The OpenMuse app was not started. Its server requires a CopilotKit Intelligence key and its UI packages are excluded. Review rules were adapted into packages/task-logic and run there.",
+  "sources": [
+    {
+      "name": "hermes-agent",
+      "url": "https://github.com/NousResearch/hermes-agent",
+      "version": "0.21.5",
+      "git_tag": "v2026.9.24",
+      "sha": "f97608f178d1ffeca59860195ab7da295f7c8e5f",
+      "license": "MIT",
+      "license_path": "upstream/hermes-agent/LICENSE",
+      "lockfile": "upstream/hermes-agent/uv.lock",
+      "runtime": "Python >=3.11,<3.14 via uv. System Python 3.14 is outside that range. Audit used CPython 3.12.15.",
+      "distribution": "uv sync --frozen from the pinned tag. Process entry: python -m tui_gateway.entry",
+      "selected_modules": [
+        "tui_gateway",
+        "tools/approval.py",
+        "agent runtime and tool registry",
+        "hermes session store, memory, and skills",
+        "computer_use integration via pinned cua-driver",
+        "voice configuration, used by the voice milestone"
+      ],
+      "local_patches": []
+    },
+    {
+      "name": "openmuse",
+      "url": "https://github.com/CopilotKit/openmuse",
+      "version": "0.1.0",
+      "git_tag": null,
+      "sha": "b06caad7005ac5b6d2b451752a3794a6ae1759c1",
+      "tag_note": "No release tags exist. This is the default-branch HEAD observed on 2026-10-04, pinned by SHA so the checkout does not follow moving main.",
+      "license": "MIT",
+      "license_path": "upstream/openmuse/LICENSE",
+      "lockfile": "upstream/openmuse/pnpm-lock.yaml",
+      "runtime": "Node >=22, upstream packageManager pnpm@11.19.0. This repo uses pnpm 11.24.0 for its own workspace and does not install OpenMuse dependencies.",
+      "distribution": "Not shipped. Logic only.",
+      "selected_modules": [
+        "apps/server/src/actions.ts review binding, expiry, idempotency, and cancelled-task refusal",
+        "packages/domain task status names and proposal hash fields"
+      ],
+      "local_patches": []
+    },
+    {
+      "name": "cua-driver",
+      "url": "https://github.com/trycua/cua",
+      "sha": null,
+      "sha_note": "Not cloned. Hermes v2026.9.24 documents cua-driver as a PM-pinned package launched through CuaDriver.app. This project does not vendor a second copy.",
+      "license": "See the Hermes-pinned package manifest at install time",
+      "selected_modules": ["computer_use toolset, only if a later milestone enables it through the coordinator"],
+      "local_patches": []
+    }
+  ]
+}

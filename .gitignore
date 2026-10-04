@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.build/
+.swiftpm/
+*.xcuserstate
+.DS_Store
+upstream/
+data/
+*.sqlite
+*.sqlite-journal
+dist/
+.env
+.hermes/
